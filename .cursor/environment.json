@@ -1,0 +1,17 @@
+{
+  "name": "Exa MCP Server",
+  "install": "npm ci && npm run build",
+  "terminals": [
+    {
+      "name": "exa-mcp-http",
+      "command": "PORT=8081 node smithery/shttp/index.cjs",
+      "description": "Exa MCP server over Streamable HTTP on http://localhost:8081/mcp (POST). Protocol methods (initialize, tools/list, resources/read) work without credentials. Set the EXA_API_KEY secret to enable live web_search_exa / web_fetch_exa calls; without it, tool calls return a clear 401 asking for an API key."
+    }
+  ],
+  "ports": [
+    {
+      "name": "exa-mcp-http",
+      "port": 8081
+    }
+  ]
+}
