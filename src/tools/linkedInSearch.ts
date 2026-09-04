@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { Exa } from "exa-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { API_CONFIG, integrationHeaders } from "./config.js";
+import { API_CONFIG, createExaClient, integrationHeaders } from "./config.js";
 import { ExaSearchRequest, ExaSearchResponse } from "../types.js";
 import { createRequestLogger } from "../utils/logger.js";
 import { retryWithBackoff, formatToolError } from "../utils/errorHandler.js";
 import { sanitizeSearchResponse } from "../utils/exaResponseSanitizer.js";
+import { lenientString, lenientOptionalNumber } from "./validation.js";
 import { checkpoint } from "agnost";
 
 export function registerLinkedInSearchTool(server: McpServer, config?: { exaApiKey?: string; userProvidedApiKey?: boolean }): void {
@@ -13,8 +13,8 @@ export function registerLinkedInSearchTool(server: McpServer, config?: { exaApiK
     "linkedin_search_exa",
     "⚠️ DEPRECATED: This tool is deprecated. Please use 'people_search_exa' instead. This tool will be removed in a future version. For now, it searches for people on LinkedIn using Exa AI - finds professional profiles and people.",
     {
-      query: z.string().describe("Search query for finding people on LinkedIn"),
-      numResults: z.coerce.number().optional().describe("Number of LinkedIn profile results to return (must be a number, default: 5)")
+      query: lenientString().describe("Search query for finding people on LinkedIn"),
+      numResults: lenientOptionalNumber().describe("Number of LinkedIn profile results to return (default: 5)")
     },
     {
       readOnlyHint: true,
@@ -22,13 +22,12 @@ export function registerLinkedInSearchTool(server: McpServer, config?: { exaApiK
       idempotentHint: true
     },
     async ({ query, numResults }) => {
-      const requestId = `linkedin_search_exa-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const logger = createRequestLogger(requestId, 'linkedin_search_exa');
+      const logger = createRequestLogger('linkedin_search_exa');
       
       logger.start(`${query}`);
       
       try {
-        const exa = new Exa(config?.exaApiKey || process.env.EXA_API_KEY || '');
+        const exa = createExaClient(config);
 
         let searchQuery = query;
         searchQuery = `${query} LinkedIn profile`;

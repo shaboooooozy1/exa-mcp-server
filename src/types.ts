@@ -1,8 +1,8 @@
 // Exa API Types
 export interface ExaSearchRequest {
   query: string;
-  type: 'auto' | 'fast' | 'deep' | 'deep-reasoning';
-  category?: 'company' | 'research paper' | 'news' | 'pdf' | 'github' | 'personal site' | 'people' | 'financial report';
+  type: 'auto' | 'fast' | 'instant' | 'deep' | 'deep-reasoning';
+  category?: 'company' | 'publication' | 'news' | 'pdf' | 'github' | 'personal site' | 'people' | 'financial report';
   includeDomains?: string[];
   excludeDomains?: string[];
   startPublishedDate?: string;
@@ -34,7 +34,7 @@ export interface ExaAdvancedSearchRequest {
   query: string;
   type: 'auto' | 'fast' | 'instant';
   numResults?: number;
-  category?: 'company' | 'research paper' | 'news' | 'pdf' | 'github' | 'personal site' | 'people' | 'financial report';
+  category?: 'company' | 'publication' | 'news' | 'pdf' | 'github' | 'personal site' | 'people' | 'financial report';
   includeDomains?: string[];
   excludeDomains?: string[];
   startPublishedDate?: string;
@@ -248,3 +248,33 @@ export interface ExaCodeResponse {
   outputTokens?: number;
   traces?: any;
 }
+
+export type AgentEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "auto";
+export type AgentDataSourceProvider =
+  | "fiber"
+  | "financial_datasets"
+  | "similarweb"
+  | "baselayer"
+  | "affiliate"
+  | "particle"
+  | "jinko";
+
+export type AgentRunInput = {
+  query: string;
+  systemPrompt?: string;
+  input?: {
+    data?: Array<Record<string, unknown>>;
+    exclusion?: Array<Record<string, unknown>>;
+  };
+  outputSchema?: Record<string, unknown> | null;
+  effort?: AgentEffort;
+  previousRunId?: string;
+  dataSources?: Array<{
+    provider: AgentDataSourceProvider;
+  }>;
+};
+
+export type ToolContent = {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: true;
+};

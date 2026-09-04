@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { Exa } from "exa-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { API_CONFIG, integrationHeaders } from "./config.js";
+import { API_CONFIG, createExaClient, integrationHeaders } from "./config.js";
 import { ExaSearchRequest, ExaSearchResponse } from "../types.js";
 import { createRequestLogger } from "../utils/logger.js";
 import { retryWithBackoff, formatToolError } from "../utils/errorHandler.js";
 import { sanitizeSearchResponse } from "../utils/exaResponseSanitizer.js";
+import { lenientString, lenientOptionalNumber } from "./validation.js";
 import { checkpoint } from "agnost";
 
 export function registerPeopleSearchTool(server: McpServer, config?: { exaApiKey?: string; userProvidedApiKey?: boolean }): void {
@@ -16,8 +16,8 @@ export function registerPeopleSearchTool(server: McpServer, config?: { exaApiKey
 Best for: Finding professionals, executives, or anyone with a public profile.
 Returns: Profile information and links.`,
     {
-      query: z.string().describe("Search query for finding people"),
-      numResults: z.coerce.number().optional().describe("Number of profile results to return (must be a number, default: 5)")
+      query: lenientString().describe("Search query for finding people"),
+      numResults: lenientOptionalNumber().describe("Number of profile results to return (default: 5)")
     },
     {
       readOnlyHint: true,
@@ -25,13 +25,12 @@ Returns: Profile information and links.`,
       idempotentHint: true
     },
     async ({ query, numResults }) => {
-      const requestId = `people_search_exa-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const logger = createRequestLogger(requestId, 'people_search_exa');
+      const logger = createRequestLogger('people_search_exa');
       
       logger.start(`${query}`);
       
       try {
-        const exa = new Exa(config?.exaApiKey || process.env.EXA_API_KEY || '');
+        const exa = createExaClient(config);
 
         let searchQuery = query;
         searchQuery = `${query} profile`;

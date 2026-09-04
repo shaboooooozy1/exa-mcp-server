@@ -1,17 +1,17 @@
 import { z } from "zod";
-import { Exa } from "exa-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { API_CONFIG, integrationHeaders } from "./config.js";
+import { API_CONFIG, createExaClient, integrationHeaders } from "./config.js";
 import { ExaSearchRequest, ExaSearchResponse } from "../types.js";
 import { createRequestLogger } from "../utils/logger.js";
-import { retryWithBackoff, formatToolError } from "../utils/errorHandler.js";
+import { retryWithBackoff, formatToolError, withTimeout } from "../utils/errorHandler.js";
 import { sanitizeSearchResponse } from "../utils/exaResponseSanitizer.js";
+import { lenientString, lenientOptionalNumber } from "./validation.js";
 import { checkpoint } from "agnost"
 
 type WebSearchConfig = {
   exaApiKey?: string;
   userProvidedApiKey?: boolean;
-  defaultSearchType?: 'auto' | 'fast';
+  defaultSearchType?: 'auto' | 'fast' | 'instant';
   exaSource?: string;
   mcpSessionId?: string;
 };
@@ -29,8 +29,8 @@ export function registerWebSearchTool(server: McpServer, config?: WebSearchConfi
       Use category:people / category:company to search through Linkedin profiles / companies respectively.
       If highlights are insufficient, follow up with web_fetch_exa on the best URLs.`,
     {
-      query: z.string().describe("Natural language search query. Should be a semantically rich description of the ideal page, not just keywords. Optionally include category:<type> (company, people) to focus results — e.g. 'category:people John Doe software engineer'."),
-      numResults: z.coerce.number().min(1).max(100).optional().describe("Number of search results to return (must be a number, default: 10)."),
+      query: lenientString().describe("Natural language search query. Should be a semantically rich description of the ideal page, not just keywords. Optionally include category:<type> (company, people) to focus results — e.g. 'category:people John Doe software engineer'."),
+      numResults: lenientOptionalNumber().describe("Number of search results to return (default: 10)."),
     },
     {
       readOnlyHint: true,
@@ -40,18 +40,17 @@ export function registerWebSearchTool(server: McpServer, config?: WebSearchConfi
     },
     async ({ query, numResults }) => {
       const toolId = toolName || 'web_search_exa';
-      const requestId = `${toolId}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const logger = createRequestLogger(requestId, toolId);
+      const logger = createRequestLogger(toolId);
 
       // Extract category:<type> from query string if present
-      const categoryMatch = query.match(/\bcategory:(company|research\s*paper|news|personal\s*site|people)\b/i);
-      const category = categoryMatch ? categoryMatch[1].toLowerCase().replace(/\s+/g, ' ') as "company" | "research paper" | "news" | "personal site" | "people" : undefined;
+      const categoryMatch = query.match(/\bcategory:(company|publication|news|personal\s*site|people)\b/i);
+      const category = categoryMatch ? categoryMatch[1].toLowerCase().replace(/\s+/g, ' ') as "company" | "publication" | "news" | "personal site" | "people" : undefined;
       const cleanedQuery = categoryMatch ? query.replace(categoryMatch[0], '').replace(/\s+/g, ' ').trim() : query;
 
       logger.start(cleanedQuery);
 
       try {
-        const exa = new Exa(config?.exaApiKey || process.env.EXA_API_KEY || '');
+        const exa = createExaClient(config);
 
         const searchRequest: ExaSearchRequest = {
           query: cleanedQuery,
@@ -66,13 +65,17 @@ export function registerWebSearchTool(server: McpServer, config?: WebSearchConfi
         checkpoint('web_search_request_prepared');
         logger.log("Sending request to Exa API");
 
-        const response = await retryWithBackoff(() => exa.request<ExaSearchResponse>(
-          API_CONFIG.ENDPOINTS.SEARCH,
-          'POST',
-          searchRequest,
-          undefined,
-          integrationHeaders('web-search-mcp', config)
-        ));
+        const response = await withTimeout(
+          () => retryWithBackoff(() => exa.request<ExaSearchResponse>(
+            API_CONFIG.ENDPOINTS.SEARCH,
+            'POST',
+            searchRequest,
+            undefined,
+            integrationHeaders('web-search-mcp', config)
+          )),
+          API_CONFIG.TOOL_TIMEOUTS.SEARCH_MS,
+          toolId,
+        );
 
         checkpoint('exa_search_response_received');
         logger.log("Received response from Exa API");

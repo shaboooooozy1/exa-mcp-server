@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { Exa } from "exa-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { API_CONFIG, integrationHeaders } from "./config.js";
+import { API_CONFIG, createExaClient, integrationHeaders } from "./config.js";
 import { ExaSearchRequest, ExaSearchResponse } from "../types.js";
 import { createRequestLogger } from "../utils/logger.js";
 import { retryWithBackoff, formatToolError } from "../utils/errorHandler.js";
 import { sanitizeSearchResponse } from "../utils/exaResponseSanitizer.js";
+import { lenientString, lenientOptionalNumber } from "./validation.js";
 import { checkpoint } from "agnost";
 
 export function registerExaCodeTool(server: McpServer, config?: { exaApiKey?: string; userProvidedApiKey?: boolean }): void {
@@ -19,8 +19,8 @@ Returns: Relevant code and documentation.
 Query tips: describe what you're looking for specifically. "Python requests library POST with JSON body" not "python http".
 If highlights are insufficient, follow up with web_fetch_exa on the best URLs.`,
     {
-      query: z.string().describe("Search query to find relevant context for APIs, Libraries, and SDKs. For example, 'React useState hook examples', 'Python pandas dataframe filtering', 'Express.js middleware', 'Next js partial prerendering configuration'"),
-      numResults: z.coerce.number().min(1).max(20).optional().describe("Number of search results to return (must be a number, default: 8)"),
+      query: lenientString().describe("Search query to find relevant context for APIs, Libraries, and SDKs. For example, 'React useState hook examples', 'Python pandas dataframe filtering', 'Express.js middleware', 'Next js partial prerendering configuration'"),
+      numResults: lenientOptionalNumber().describe("Number of search results to return (default: 8)"),
     },
     {
       readOnlyHint: true,
@@ -28,13 +28,12 @@ If highlights are insufficient, follow up with web_fetch_exa on the best URLs.`,
       idempotentHint: true
     },
     async ({ query, numResults }) => {
-      const requestId = `get_code_context_exa-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const logger = createRequestLogger(requestId, 'get_code_context_exa');
+      const logger = createRequestLogger('get_code_context_exa');
 
       logger.start(`Searching for code context: ${query}`);
 
       try {
-        const exa = new Exa(config?.exaApiKey || process.env.EXA_API_KEY || '');
+        const exa = createExaClient(config);
 
         const searchRequest: ExaSearchRequest = {
           query,

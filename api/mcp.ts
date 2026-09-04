@@ -1,10 +1,25 @@
 process.env.AGNOST_LOG_LEVEL = 'error';
 
+import { randomUUID } from 'node:crypto';
 import { createMcpHandler } from 'mcp-handler';
-import { initializeMcpServer } from '../src/mcp-handler.js';
+import type { Implementation } from '@modelcontextprotocol/sdk/types.js';
+import { initializeMcpServer, type McpConfig } from '../src/mcp-handler.js';
+import { DEFAULT_MCP_MAX_DURATION_SECONDS, parsePositiveInteger } from '../src/tools/agentRun.js';
 import { Ratelimit } from '@upstash/ratelimit';
 import { Redis } from '@upstash/redis';
 import { isJwtToken, verifyOAuthToken } from '../src/utils/auth.js';
+import {
+  expandToolSelection,
+  requiresUserProvidedApiKey,
+  type ToolId,
+} from '../src/toolRegistry.js';
+import {
+  buildMcpClientMetadata,
+  extractInitializeClientInfo,
+  MCP_CLIENT_SESSION_TTL_SECONDS,
+  sanitizeMcpClientMetadata,
+  type McpClientMetadata,
+} from '../src/utils/mcpClientMetadata.js';
 
 // Origin: '*' is safe — auth is per-request via headers/query, never cookies.
 const CORS_HEADERS: Record<string, string> = {
@@ -48,6 +63,59 @@ let qpsLimiter: Ratelimit | null = null;
 let dailyLimiter: Ratelimit | null = null;
 let rateLimitersInitialized = false;
 let redisClient: Redis | null = null;
+
+function getMcpClientSessionKey(sessionId: string): string {
+  return `exa-mcp:client:${sessionId}`;
+}
+
+async function saveMcpClientMetadata(sessionId: string | undefined, metadata: McpClientMetadata | undefined, debug: boolean): Promise<void> {
+  if (!sessionId || !metadata?.clientInfo) {
+    return;
+  }
+
+  initializeRateLimiters();
+
+  if (!redisClient) {
+    return;
+  }
+
+  try {
+    await redisClient.set(getMcpClientSessionKey(sessionId), JSON.stringify(metadata), {
+      ex: MCP_CLIENT_SESSION_TTL_SECONDS,
+    });
+  } catch (error) {
+    if (debug) {
+      console.error('[EXA-MCP] Failed to save MCP client metadata:', error);
+    }
+  }
+}
+
+async function loadMcpClientMetadata(sessionId: string | undefined, debug: boolean): Promise<McpClientMetadata | undefined> {
+  if (!sessionId) {
+    return undefined;
+  }
+
+  initializeRateLimiters();
+
+  if (!redisClient) {
+    return undefined;
+  }
+
+  try {
+    const value = await redisClient.get<string>(getMcpClientSessionKey(sessionId));
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const parsed: unknown = JSON.parse(value);
+    return sanitizeMcpClientMetadata(parsed);
+  } catch (error) {
+    if (debug) {
+      console.error('[EXA-MCP] Failed to load MCP client metadata:', error);
+    }
+    return undefined;
+  }
+}
 
 function initializeRateLimiters(): boolean {
   if (rateLimitersInitialized) {
@@ -96,13 +164,11 @@ function initializeRateLimiters(): boolean {
   }
 }
 
-function getClientIp(request: Request): string {
-  const cfConnectingIp = request.headers.get('cf-connecting-ip');
-  const xRealIp = request.headers.get('x-real-ip');
-  const xForwardedFor = request.headers.get('x-forwarded-for');
-  const xForwardedForFirst = xForwardedFor?.split(',')[0]?.trim();
+function getClientIp(request: Request): string | null {
+  const vercelForwarded = request.headers.get('x-vercel-forwarded-for');
+  const vercelForwardedFirst = vercelForwarded?.split(',')[0]?.trim();
 
-  return cfConnectingIp ?? xRealIp ?? xForwardedForFirst ?? 'unknown';
+  return vercelForwardedFirst || null;
 }
 
 const RATE_LIMIT_ERROR_MESSAGE = `You've hit Exa's free MCP rate limit. To continue using without limits, create your own Exa API key.
@@ -141,15 +207,22 @@ function createRateLimitResponse(retryAfterSeconds: number, reset: number): Resp
   );
 }
 
-/**
- * Check if a JSON-RPC request is a tools/call method that should be rate limited.
- * Returns true only for actual tool invocations, not for protocol methods like
- * tools/list, initialize, ping, resources/list, prompts/list, etc.
- */
-function isRateLimitedMethod(body: string): boolean {
+function countRateLimitedCalls(body: string): number {
   try {
     const parsed = JSON.parse(body);
-    return parsed.method === 'tools/call';
+    const messages = Array.isArray(parsed) ? parsed : [parsed];
+    return messages.filter(
+      (message) => message && typeof message === 'object' && message.method === 'tools/call'
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+function isInitializeMethod(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body);
+    return parsed.method === 'initialize';
   } catch {
     return false;
   }
@@ -199,14 +272,21 @@ async function saveBypassRequestInfo(ip: string, userAgent: string, debug: boole
  * Check rate limits for a given IP.
  * Returns null if within limits, or a Response if rate limited.
  */
-async function checkRateLimits(ip: string, debug: boolean): Promise<Response | null> {
+async function checkRateLimits(ip: string | null, count: number, debug: boolean): Promise<Response | null> {
+  if (!ip) {
+    if (debug) {
+      console.log('[EXA-MCP] Skipping rate limit: trusted client IP unavailable');
+    }
+    return null;
+  }
+
   if (!qpsLimiter || !dailyLimiter) {
     return null; // Rate limiting not configured
   }
-  
+
   try {
     // Check QPS limit first (more likely to be hit)
-    const qpsResult = await qpsLimiter.limit(ip);
+    const qpsResult = await qpsLimiter.limit(ip, { rate: count });
     if (!qpsResult.success) {
       if (debug) {
         console.log(`[EXA-MCP] QPS rate limit exceeded for IP: ${ip}`);
@@ -216,7 +296,7 @@ async function checkRateLimits(ip: string, debug: boolean): Promise<Response | n
     }
     
     // Check daily limit
-    const dailyResult = await dailyLimiter.limit(ip);
+    const dailyResult = await dailyLimiter.limit(ip, { rate: count });
     if (!dailyResult.success) {
       if (debug) {
         console.log(`[EXA-MCP] Daily rate limit exceeded for IP: ${ip}`);
@@ -228,7 +308,7 @@ async function checkRateLimits(ip: string, debug: boolean): Promise<Response | n
     return null; // Within limits
   } catch (error) {
     // If rate limiting fails, allow the request through (fail open)
-    console.error('[EXA-MCP] Rate limit check failed:', error);
+    console.error('[EXA-MCP][ALERT][RATE_LIMIT_FAIL_OPEN] Rate limit check failed; allowing anonymous tools/call request:', error);
     return null;
   }
 }
@@ -247,7 +327,8 @@ async function checkRateLimits(ip: string, debug: boolean): Promise<Response | n
  * Other URL query parameters:
  * - ?tools=web_search_exa,web_fetch_exa - Enable specific tools
  * - ?debug=true - Enable debug logging
- * 
+ * - ?agentCallWindowMs=45000 - Set the agent_run call window in milliseconds
+ *
  * Also supports environment variables:
  * - EXA_API_KEY: Your Exa AI API key
  * - DEBUG: Enable debug logging (true/false)
@@ -260,9 +341,8 @@ async function checkRateLimits(ip: string, debug: boolean): Promise<Response | n
  * the request to the initializeServer callback. To support per-request
  * configuration via URL params (like ?tools=... and ?exaApiKey=...), we
  * create a fresh handler for each request. This ensures:
- * 1. Feature parity with the production Smithery-based deployment at mcp.exa.ai
- * 2. Each request gets its own configuration (no API key leakage between users)
- * 3. Users can specify different tools and API keys per request
+ * 1. Each request gets its own configuration (no API key leakage between users)
+ * 2. Users can specify different tools and API keys per request
  */
 
 /** Extract bearer token from Authorization header. */
@@ -284,13 +364,19 @@ function getBearerToken(request: Request): string | undefined {
 
 interface RequestConfig {
   exaApiKey?: string;
-  enabledTools?: string[];
+  enabledTools?: ToolId[];
   debug: boolean;
   userProvidedApiKey: boolean;
   authMethod: 'oauth' | 'api_key' | 'free_tier';
   exaSource?: string;
   mcpSessionId?: string;
-  defaultSearchType?: 'auto' | 'fast';
+  mcpClient?: McpClientMetadata;
+  defaultSearchType?: 'auto' | 'fast' | 'instant';
+  oauthAccessToken?: string;
+  /** True when a Bearer token was a JWT but failed OAuth verification (expired, bad sig, wrong issuer/audience). */
+  invalidOAuthJwt: boolean;
+  agentCallWindowMs?: number;
+  mcpMaxDurationSeconds?: number;
 }
 
 /**
@@ -299,11 +385,14 @@ interface RequestConfig {
  */
 async function getConfigFromRequest(request: Request): Promise<RequestConfig> {
   let exaApiKey = process.env.EXA_API_KEY;
-  let enabledTools: string[] | undefined;
+  let enabledTools: ToolId[] | undefined;
   let debug = process.env.DEBUG === 'true';
   let userProvidedApiKey = false;
   let authMethod: 'oauth' | 'api_key' | 'free_tier' = 'free_tier';
-  let defaultSearchType: 'auto' | 'fast' | undefined;
+  let defaultSearchType: 'auto' | 'fast' | 'instant' | undefined;
+  let oauthAccessToken: string | undefined;
+  let invalidOAuthJwt = false;
+  let agentCallWindowMs: number | undefined;
 
   // 1. Check x-api-key header (highest priority)
   const xApiKey = request.headers.get('x-api-key');
@@ -321,12 +410,15 @@ async function getConfigFromRequest(request: Request): Promise<RequestConfig> {
       if (isJwtToken(bearerToken)) {
         const claims = await verifyOAuthToken(bearerToken);
         if (claims) {
-          // The api_key_id claim IS the API key (ApiKey.id UUID = the key string)
-          exaApiKey = claims['exa:api_key_id'];
+          oauthAccessToken = bearerToken;
+          exaApiKey = undefined;
           userProvidedApiKey = true;
           authMethod = 'oauth';
         } else {
-          // JWT verification failed — don't fall through to treating it as an API key
+          // JWT verification failed — flag so the caller can return 401 with
+          // a WWW-Authenticate challenge instead of silently falling through to
+          // the env API key or free tier.
+          invalidOAuthJwt = true;
           console.error('[EXA-MCP] Invalid OAuth JWT token');
         }
       } else {
@@ -356,10 +448,12 @@ async function getConfigFromRequest(request: Request): Promise<RequestConfig> {
     if (params.has('tools')) {
       const toolsParam = params.get('tools');
       if (toolsParam) {
-        enabledTools = toolsParam
+        enabledTools = expandToolSelection(
+          toolsParam
           .split(',')
           .map(t => t.trim())
-          .filter(t => t.length > 0);
+          .filter(t => t.length > 0),
+        );
       }
     }
 
@@ -368,10 +462,13 @@ async function getConfigFromRequest(request: Request): Promise<RequestConfig> {
       debug = params.get('debug') === 'true';
     }
 
-    // Support ?defaultSearchType=auto|fast
+    // Support ?agentCallWindowMs
+    agentCallWindowMs = parsePositiveInteger(params.get('agentCallWindowMs') ?? undefined);
+
+    // Support ?defaultSearchType
     if (params.has('defaultSearchType')) {
       const dst = params.get('defaultSearchType');
-      if (dst === 'auto' || dst === 'fast') {
+      if (dst === 'auto' || dst === 'fast' || dst === 'instant') {
         defaultSearchType = dst;
       }
     }
@@ -384,16 +481,38 @@ async function getConfigFromRequest(request: Request): Promise<RequestConfig> {
 
   // Fall back to env vars if no query params were found
   if (!enabledTools && process.env.ENABLED_TOOLS) {
-    enabledTools = process.env.ENABLED_TOOLS
-      .split(',')
-      .map(t => t.trim())
-      .filter(t => t.length > 0);
+    enabledTools = expandToolSelection(
+      process.env.ENABLED_TOOLS
+        .split(',')
+        .map(t => t.trim())
+        .filter(t => t.length > 0),
+    );
+  }
+
+  if (!defaultSearchType && process.env.DEFAULT_SEARCH_TYPE) {
+    const dst = process.env.DEFAULT_SEARCH_TYPE;
+    if (dst === 'auto' || dst === 'fast' || dst === 'instant') {
+      defaultSearchType = dst;
+    }
   }
 
   const exaSource = request.headers.get('x-exa-source') || undefined;
   const mcpSessionId = request.headers.get('MCP-Session-Id') || undefined;
 
-  return { exaApiKey, enabledTools, debug, userProvidedApiKey, authMethod, exaSource, mcpSessionId, defaultSearchType };
+  return {
+    exaApiKey,
+    enabledTools,
+    debug,
+    userProvidedApiKey,
+    authMethod,
+    exaSource,
+    mcpSessionId,
+    defaultSearchType,
+    oauthAccessToken,
+    invalidOAuthJwt,
+    mcpMaxDurationSeconds: parsePositiveInteger(process.env.MCP_MAX_DURATION_SECONDS),
+    agentCallWindowMs: agentCallWindowMs ?? parsePositiveInteger(process.env.AGENT_CALL_WINDOW_MS),
+  };
 }
 
 /**
@@ -402,13 +521,25 @@ async function getConfigFromRequest(request: Request): Promise<RequestConfig> {
  * configuration (tools and API key). This prevents API key leakage between
  * different users who might pass different keys via URL.
  */
-function createHandler(config: { exaApiKey?: string; enabledTools?: string[]; debug: boolean; userProvidedApiKey: boolean; exaSource?: string; mcpSessionId?: string; defaultSearchType?: 'auto' | 'fast' }) {
+function createHandler(config: McpConfig) {
+  const maxDuration = config.mcpMaxDurationSeconds ?? DEFAULT_MCP_MAX_DURATION_SECONDS;
+
   return createMcpHandler(
     (server: any) => {
       initializeMcpServer(server, config);
     },
-    {}, // Server options
-    { basePath: '/api' } // Config - basePath for Vercel Functions
+    {
+      serverInfo: {
+        name: 'exa-search-server',
+        title: 'Exa',
+        version: '3.2.1',
+        websiteUrl: 'https://exa.ai',
+        icons: [
+          { src: 'https://exa.ai/images/favicon-32x32.png', mimeType: 'image/png', sizes: ['32x32'] },
+        ],
+      } satisfies Implementation as { name: string; version: string },
+    },
+    { basePath: '/api', maxDuration }
   );
 }
 
@@ -424,21 +555,43 @@ function hasAuth(request: Request): boolean {
   return false;
 }
 
-function create401Response(): Response {
+/**
+ * Build a 401 Unauthorized response with an OAuth `Bearer` challenge.
+ *
+ * `reason` controls the `WWW-Authenticate` parameters per RFC 6750 §3:
+ * - 'missing'        — no credentials were presented; advertise the resource so the client can start a flow.
+ * - 'invalid_token'  — a token was presented but failed verification; include `error="invalid_token"` so the
+ *                      client can distinguish "refresh/re-auth" from "start over from scratch" and trigger its
+ *                      refresh-token exchange against the authorization server.
+ */
+function create401Response(reason: 'missing' | 'invalid_token' = 'missing', resourcePath: string = 'mcp'): Response {
+  const params: string[] = [];
+  if (reason === 'invalid_token') {
+    params.push('error="invalid_token"');
+    params.push('error_description="The access token is invalid or expired"');
+  }
+  // RFC 9728: metadata lives at /.well-known/oauth-protected-resource/<resource path>,
+  // and its `resource` field must exactly match the URL the client connected to.
+  params.push(`resource_metadata="https://mcp.exa.ai/.well-known/oauth-protected-resource/${resourcePath}"`);
+
+  const message =
+    reason === 'invalid_token'
+      ? 'The access token is invalid or expired. Refresh or re-authenticate.'
+      : 'Authentication required. Use OAuth or provide an API key.';
+
   return new Response(
     JSON.stringify({
       jsonrpc: '2.0',
       error: {
         code: -32000,
-        message: 'Authentication required. Use OAuth or provide an API key.',
+        message,
       },
       id: null,
     }),
     {
       status: 401,
       headers: {
-        'WWW-Authenticate':
-          'Bearer resource_metadata="https://mcp.exa.ai/.well-known/oauth-protected-resource"',
+        'WWW-Authenticate': `Bearer ${params.join(', ')}`,
         'Content-Type': 'application/json',
         ...CORS_HEADERS,
       },
@@ -447,7 +600,7 @@ function create401Response(): Response {
 }
 
 // Wrap so uncaught throws still return CORS headers — otherwise browsers see an opaque CORS error masking the real failure.
-async function handleRequest(request: Request, options?: { forceOAuth?: boolean }): Promise<Response> {
+async function handleRequest(request: Request, options?: { forceOAuth?: boolean; resourcePath?: string }): Promise<Response> {
   try {
     return await processRequest(request, options);
   } catch (error) {
@@ -467,8 +620,11 @@ async function handleRequest(request: Request, options?: { forceOAuth?: boolean 
  * Main request handler that extracts config from URL and creates
  * a fresh handler for each request
  */
-async function processRequest(request: Request, options?: { forceOAuth?: boolean }): Promise<Response> {
+async function processRequest(request: Request, options?: { forceOAuth?: boolean; resourcePath?: string }): Promise<Response> {
   const debug = process.env.DEBUG === 'true';
+  const body = request.method === 'POST' ? await request.clone().text() : undefined;
+  const isInitializeRequest = isInitializeMethod(body ?? '');
+  const initializeClientInfo = extractInitializeClientInfo(body);
 
   // Check user-agent bypass BEFORE the 401 gate so bypass clients never see auth prompts
   const userAgent = request.headers.get('user-agent') || '';
@@ -484,14 +640,44 @@ async function processRequest(request: Request, options?: { forceOAuth?: boolean
   const requestUrl = new URL(request.url);
   const isPluginClient = requestUrl.searchParams.get('client')?.includes('plugin') ?? false;
 
-  // Gate: require auth for /mcp/oauth endpoint, matching user agents, or plugin clients (unless bypassed)
-  const requireOAuth = options?.forceOAuth || userAgentMatchesOAuth || isPluginClient;
+  const loginParam = requestUrl.searchParams.get('login');
+  const wantsLogin =
+    loginParam !== null &&
+    (loginParam === '' || ['1', 'true', 'yes'].includes(loginParam.toLowerCase()));
+
+  // Gate: require auth for the dedicated /mcp/oauth endpoint, ?login opt-in,
+  // matching user agents, or plugin clients (unless bypassed).
+  const requireOAuth = options?.forceOAuth || userAgentMatchesOAuth || isPluginClient || wantsLogin;
+  const resourcePath = options?.resourcePath ?? 'mcp';
   if (!bypassRateLimit && requireOAuth && !hasAuth(request)) {
-    return create401Response();
+    return create401Response('missing', resourcePath);
   }
 
   // Extract configuration from request headers, URL, and env vars
   const config = await getConfigFromRequest(request);
+
+  // A Bearer JWT that fails verification (expired, bad signature, wrong issuer/audience)
+  // must produce a 401 + WWW-Authenticate challenge so the client knows to refresh or
+  // re-authenticate. Falling through to the env API key or free tier would mask the
+  // expired-credential signal and prevent the client's refresh flow from triggering.
+  // Use the `invalid_token` reason so the WWW-Authenticate header carries the standard
+  // OAuth error code that clients listen for when deciding to exchange a refresh token.
+  if (config.invalidOAuthJwt) {
+    return create401Response('invalid_token', resourcePath);
+  }
+
+  if (!config.userProvidedApiKey && config.enabledTools?.some(requiresUserProvidedApiKey)) {
+    return create401Response('missing', resourcePath);
+  }
+
+  const storedMcpClient = isInitializeRequest ? undefined : await loadMcpClientMetadata(config.mcpSessionId, config.debug);
+  config.mcpClient = buildMcpClientMetadata({
+    source: config.exaSource,
+    sessionId: config.mcpSessionId,
+    clientInfo: initializeClientInfo,
+    stored: storedMcpClient,
+    userAgent,
+  });
   
   if (config.debug) {
     console.log(`[EXA-MCP] Request URL: ${request.url}`);
@@ -501,32 +687,33 @@ async function processRequest(request: Request, options?: { forceOAuth?: boolean
   }
   
   // Use separate API key for bypass users and save their IP/user-agent for tracking
-  if (bypassRateLimit) {
+  if (bypassRateLimit && !config.userProvidedApiKey) {
     config.exaApiKey = bypassApiKey;
     config.userProvidedApiKey = false;
     const clientIp = getClientIp(request);
-    saveBypassRequestInfo(clientIp, userAgent, config.debug);
+    if (clientIp) {
+      saveBypassRequestInfo(clientIp, userAgent, config.debug);
+    } else if (config.debug) {
+      console.log('[EXA-MCP] Skipping bypass request info save: trusted client IP unavailable');
+    }
   }
   
   // Rate limit users who didn't provide their own API key (including bypass users)
   // Only rate limit actual tool calls (tools/call), not protocol methods like tools/list
   if (!config.userProvidedApiKey && request.method === 'POST') {
-    // Clone the request to read the body without consuming it
-    const clonedRequest = request.clone();
-    const body = await clonedRequest.text();
-    
     // Only rate limit actual tool calls, not protocol methods
-    if (isRateLimitedMethod(body)) {
+    const rateLimitedCallCount = countRateLimitedCalls(body ?? '');
+    if (rateLimitedCallCount > 0) {
       // Initialize rate limiters on first request (lazy init)
       initializeRateLimiters();
-      
+
       const clientIp = getClientIp(request);
-      
+
       if (config.debug) {
-        console.log(`[EXA-MCP] Client IP: ${clientIp}, method: tools/call`);
+        console.log(`[EXA-MCP] Client IP: ${clientIp ?? 'unavailable'}, tools/call count: ${rateLimitedCallCount}`);
       }
-      
-      const rateLimitResponse = await checkRateLimits(clientIp, config.debug);
+
+      const rateLimitResponse = await checkRateLimits(clientIp, rateLimitedCallCount, config.debug);
       if (rateLimitResponse) {
         return rateLimitResponse;
       }
@@ -564,7 +751,32 @@ async function processRequest(request: Request, options?: { forceOAuth?: boolean
     duplex: 'half',
   });
   
-  return withCors(await handler(request));
+  const response = withCors(await handler(request));
+
+  if (isInitializeRequest && response.ok) {
+    const responseSessionId = response.headers.get('Mcp-Session-Id') ?? config.mcpSessionId ?? randomUUID();
+    const metadata = buildMcpClientMetadata({
+      source: config.exaSource,
+      sessionId: responseSessionId,
+      clientInfo: initializeClientInfo,
+      userAgent,
+    });
+    await saveMcpClientMetadata(responseSessionId, metadata, config.debug);
+
+    if (response.headers.has('Mcp-Session-Id')) {
+      return response;
+    }
+
+    const headers = new Headers(response.headers);
+    headers.set('Mcp-Session-Id', responseSessionId);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  return response;
 }
 
 function handleOptions(): Response {

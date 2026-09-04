@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { Exa } from "exa-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { API_CONFIG, integrationHeaders } from "./config.js";
+import { API_CONFIG, createExaClient, integrationHeaders } from "./config.js";
 import { ExaSearchRequest, ExaSearchResponse } from "../types.js";
 import { createRequestLogger } from "../utils/logger.js";
 import { retryWithBackoff, formatToolError } from "../utils/errorHandler.js";
 import { sanitizeSearchResponse } from "../utils/exaResponseSanitizer.js";
+import { lenientOptionalNumber } from "./validation.js";
 import { checkpoint } from "agnost";
 
 export function registerCompanyResearchTool(server: McpServer, config?: { exaApiKey?: string; userProvidedApiKey?: boolean }): void {
@@ -17,7 +17,7 @@ Best for: Learning about a company's products, services, recent news, or industr
 Returns: Company information from trusted business sources.`,
     {
       companyName: z.string().describe("Name of the company to research"),
-      numResults: z.coerce.number().optional().describe("Number of search results to return (must be a number, default: 3)")
+      numResults: lenientOptionalNumber().describe("Number of search results to return (default: 3)")
     },
     {
       readOnlyHint: true,
@@ -25,13 +25,12 @@ Returns: Company information from trusted business sources.`,
       idempotentHint: true
     },
     async ({ companyName, numResults }) => {
-      const requestId = `company_research_exa-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const logger = createRequestLogger(requestId, 'company_research_exa');
+      const logger = createRequestLogger('company_research_exa');
       
       logger.start(companyName);
       
       try {
-        const exa = new Exa(config?.exaApiKey || process.env.EXA_API_KEY || '');
+        const exa = createExaClient(config);
 
         const searchRequest: ExaSearchRequest = {
           query: `${companyName} company`,
@@ -106,4 +105,4 @@ Returns: Company information from trusted business sources.`,
       }
     }
   );
-}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
+}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                

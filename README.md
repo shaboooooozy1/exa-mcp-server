@@ -230,6 +230,37 @@ Add to your Roo Code MCP config:
 </details>
 
 <details>
+<summary><b>LM Studio</b></summary>
+
+<a href="https://lmstudio.ai/install-mcp?name=exa&config=eyJ1cmwiOiJodHRwczovL21jcC5leGEuYWkvbWNwIn0%3D">
+  <img src="https://files.lmstudio.ai/deeplink/mcp-install-light.svg" alt="Add Exa MCP to LM Studio" />
+</a>
+
+Or add manually: open LM Studio, go to the Program tab, click **Install > Edit mcp.json**, and add:
+
+```json
+{
+  "exa": {
+    "url": "https://mcp.exa.ai/mcp"
+  }
+}
+```
+
+Exa's tools will appear in the chat. Ask your model to search the web, fetch a page, or research a topic.
+</details>
+
+<details>
+<summary><b>Replit</b></summary>
+
+Go to [**Integrations**](https://replit.com/integrations) > **MCP Servers** > **Add MCP Server**, then enter:
+
+- **Name:** `Exa`
+- **URL:** `https://mcp.exa.ai/mcp`
+
+Or [click here to install automatically](https://replit.com/integrations?mcp=eyJkaXNwbGF5TmFtZSI6IkV4YSIsImJhc2VVcmwiOiJodHRwczovL21jcC5leGEuYWkvbWNwIn0=).
+</details>
+
+<details>
 <summary><b>Other Clients</b></summary>
 
 For clients that support remote MCP:
@@ -278,25 +309,6 @@ Use the npm package with your API key. [Get your API key](https://dashboard.exa.
 ```
 </details>
 
-## Development
-
-Requires Node.js 20 or newer.
-
-Setup:
-```bash
-npm run setup
-```
-
-Run locally:
-```bash
-npm start
-```
-
-Run tests:
-```bash
-npm run ci
-```
-
 ## Available Tools
 
 **Enabled by Default:**
@@ -310,23 +322,48 @@ npm run ci
 | ---- | ----------- |
 | `web_search_advanced_exa` | Advanced web search with full control over filters, domains, dates, and content options |
 
-**Deprecated** (still available for backwards compatibility):
-
-| Tool | Use instead |
+**[Exa Agent](https://exa.ai/docs/reference/agent-api-guide) Tools** (optional, OAuth or API key required):
+| Tool | Description |
 | ---- | ----------- |
-| `get_code_context_exa` | `web_search_exa` |
-| `company_research_exa` | `web_search_advanced_exa` |
-| `crawling_exa` | `web_fetch_exa` |
-| `people_search_exa` | `web_search_advanced_exa` |
-| `linkedin_search_exa` | `web_search_advanced_exa` |
-| `deep_researcher_start` | [Research API](https://docs.exa.ai/reference/research/create-a-task) |
-| `deep_researcher_check` | [Research API](https://docs.exa.ai/reference/research/get-a-task) |
-| `deep_search_exa` | `web_search_advanced_exa` |
+| `agent_run` | Run an Exa Agent for multi-step research, list-building, enrichment, or structured output |
 
 Enable additional tools with the `tools` parameter:
 
 ```
 https://mcp.exa.ai/mcp?exaApiKey=YOUR_KEY&tools=web_search_exa,web_search_advanced_exa,web_fetch_exa
+```
+
+If you want to use Exa Agent, enable the optional toolset like so:
+
+```
+https://mcp.exa.ai/mcp?tools=agent_tools
+```
+
+If you want both search and Exa Agent tools enabled:
+
+```
+https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,agent_tools
+```
+
+### Force OAuth login
+
+To force the OAuth handshake so users sign in with their own Exa account (useful for shared Connectors, Skills, and Plugins), add the `login` parameter:
+
+```
+https://mcp.exa.ai/mcp?login
+```
+
+Or use the `/mcp/oauth` endpoint:
+
+```
+https://mcp.exa.ai/mcp/oauth
+```
+
+Both can be combined with the `tools` parameter:
+
+```
+https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,agent_tools&login
+https://mcp.exa.ai/mcp/oauth?tools=web_search_exa,web_fetch_exa,agent_tools
 ```
 
 ## Agent Skills (Claude Skills)
@@ -838,7 +875,7 @@ You should ask the user to restart Claude Code to have the config changes take e
 </details>
 
 <details>
-<summary><b>Research Paper Search</b></summary>
+<summary><b>Research Paper/Publication Search</b></summary>
 
 Copy the content below and paste it into Claude Code. It will set up the MCP connection and skill for you.
 
@@ -854,7 +891,7 @@ Step 2: Add this Claude skill
 
 ---
 name: web-search-advanced-research-paper
-description: Search for research papers and academic content using Exa advanced search. Full filter support including date ranges and text filtering. Use when searching for academic papers, arXiv preprints, or scientific research.
+description: Search for research papers, publications and other academic content using Exa advanced search. Full filter support including date ranges and text filtering. Use when searching for academic papers, arXiv preprints, or scientific research.
 context: fork
 ---
 
@@ -862,11 +899,11 @@ context: fork
 
 ## Tool Restriction (Critical)
 
-ONLY use `web_search_advanced_exa` with `category: "research paper"`. Do NOT use other categories or tools.
+ONLY use `web_search_advanced_exa` with `category: "publication"`. Do NOT use other categories or tools.
 
 ## Full Filter Support
 
-The `research paper` category supports ALL available parameters:
+The `publication` category supports ALL available parameters:
 
 ### Core
 - `query` (required)
@@ -902,7 +939,7 @@ The `research paper` category supports ALL available parameters:
 ## Token Isolation (Critical)
 
 Never run Exa searches in main context. Always spawn Task agents:
-- Agent calls `web_search_advanced_exa` with `category: "research paper"`
+- Agent calls `web_search_advanced_exa` with `category: "publication"`
 - Agent merges + deduplicates results before presenting
 - Agent returns distilled output (brief markdown or compact JSON)
 - Main context stays clean regardless of search volume
@@ -921,7 +958,7 @@ Recent papers on a topic:
 ```
 web_search_advanced_exa {
   "query": "transformer attention mechanisms efficiency",
-  "category": "research paper",
+  "category": "publication",
   "startPublishedDate": "2024-01-01",
   "numResults": 15,
   "type": "auto"
@@ -932,7 +969,7 @@ Papers from specific venues:
 ```
 web_search_advanced_exa {
   "query": "large language model agents",
-  "category": "research paper",
+  "category": "publication",
   "includeDomains": ["arxiv.org", "openreview.net"],
   "includeText": ["LLM"],
   "numResults": 20,
