@@ -11,6 +11,15 @@ smithery/
 .env
 .env.local
 .env*.local
+.env.*
+!.env.example
+
+# Keys / certificates / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
 
 # Logs
 *.log

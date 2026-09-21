@@ -40,8 +40,17 @@ Best for: Extracting full content from known URLs. Batch multiple URLs in one ca
 Returns: Clean text content and metadata from the page(s).`,
     {
       urls: z.preprocess(
-        (val) => typeof val === 'string' ? JSON.parse(val) : val,
-        z.array(z.string())
+        (val) => {
+          if (typeof val !== 'string') return val;
+          try { return JSON.parse(val); } catch { return val; }
+        },
+        z.array(
+          z.string().min(1).refine((u) => {
+            // Defense-in-depth only: the fetch itself runs on Exa's infrastructure.
+            // Allow scheme-less strings (Exa normalizes them); reject explicit non-http(s) schemes.
+            try { return /^https?:$/.test(new URL(u).protocol); } catch { return true; }
+          }, { message: 'Only http(s) URLs are supported' })
+        )
       ).describe("URLs to read. Batch multiple URLs in one call."),
       maxCharacters: z.coerce.number().min(1).optional().describe("Maximum characters to extract per page (must be a positive number, default: 3000)"),
     },
