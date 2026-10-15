@@ -202,6 +202,23 @@ describe("api/mcp API key configuration", () => {
     expect(initializeMcpServerMock).not.toHaveBeenCalled();
   });
 
+  it("rejects a bearer token that fails OAuth verification when OAuth is forced", async () => {
+    process.env.EXA_API_KEY = "env-key";
+    verifyOAuthTokenMock.mockResolvedValue(null);
+
+    const { response } = await callHandleRequest(
+      new Request("https://mcp.exa.ai/mcp/oauth", {
+        headers: { authorization: "Bearer invalid-jwt" },
+      }),
+      { forceOAuth: true },
+    );
+
+    expect(verifyOAuthTokenMock).toHaveBeenCalledWith("invalid-jwt");
+    expect(response.status).toBe(401);
+    expect(createMcpHandlerMock).not.toHaveBeenCalled();
+    expect(initializeMcpServerMock).not.toHaveBeenCalled();
+  });
+
   it("uses the internal bypass API key without treating it as user-provided", async () => {
     process.env.RATE_LIMIT_BYPASS = "BypassClient";
     process.env.EXA_API_KEY_BYPASS = "bypass-key";

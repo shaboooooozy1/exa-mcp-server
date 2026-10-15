@@ -41,6 +41,7 @@ function withCors(response: Response): Response {
  * - KV_REST_API_TOKEN or UPSTASH_REDIS_REST_TOKEN: Redis auth token
  * - RATE_LIMIT_QPS: Queries per second limit (default: 2)
  * - RATE_LIMIT_DAILY: Daily request quota (default: 50)
+ * - TRUST_CF_CONNECTING_IP: set to 'true' only when Cloudflare fronts this origin
  */
 
 // Lazy-initialize rate limiters only when Upstash is configured
@@ -97,7 +98,11 @@ function initializeRateLimiters(): boolean {
 }
 
 function getClientIp(request: Request): string {
-  const cfConnectingIp = request.headers.get('cf-connecting-ip');
+  // cf-connecting-ip is only authoritative when the deployment is actually fronted by
+  // Cloudflare; on a bare Vercel origin it is client-controlled. Opt in explicitly.
+  const cfConnectingIp = process.env.TRUST_CF_CONNECTING_IP === 'true'
+    ? request.headers.get('cf-connecting-ip')
+    : null;
   const xRealIp = request.headers.get('x-real-ip');
   const xForwardedFor = request.headers.get('x-forwarded-for');
   const xForwardedForFirst = xForwardedFor?.split(',')[0]?.trim();
@@ -149,7 +154,8 @@ function createRateLimitResponse(retryAfterSeconds: number, reset: number): Resp
 function isRateLimitedMethod(body: string): boolean {
   try {
     const parsed = JSON.parse(body);
-    return parsed.method === 'tools/call';
+    const messages = Array.isArray(parsed) ? parsed : [parsed];
+    return messages.some((m) => m?.method === 'tools/call');
   } catch {
     return false;
   }
@@ -412,18 +418,6 @@ function createHandler(config: { exaApiKey?: string; enabledTools?: string[]; de
   );
 }
 
-function hasAuth(request: Request): boolean {
-  if (request.headers.get('x-api-key')) return true;
-  if (getBearerToken(request)) return true;
-  try {
-    const url = new URL(request.url);
-    if (url.searchParams.get('exaApiKey')) return true;
-  } catch {
-    // URL parsing failed — no auth
-  }
-  return false;
-}
-
 function create401Response(): Response {
   return new Response(
     JSON.stringify({
@@ -484,17 +478,23 @@ async function processRequest(request: Request, options?: { forceOAuth?: boolean
   const requestUrl = new URL(request.url);
   const isPluginClient = requestUrl.searchParams.get('client')?.includes('plugin') ?? false;
 
-  // Gate: require auth for /mcp/oauth endpoint, matching user agents, or plugin clients (unless bypassed)
   const requireOAuth = options?.forceOAuth || userAgentMatchesOAuth || isPluginClient;
-  if (!bypassRateLimit && requireOAuth && !hasAuth(request)) {
-    return create401Response();
-  }
 
   // Extract configuration from request headers, URL, and env vars
   const config = await getConfigFromRequest(request);
-  
+
+  // Gate: /mcp/oauth, OAUTH_USER_AGENTS clients and plugin clients must present a credential that
+  // actually resolved (verified OAuth JWT or user-supplied API key). A JWT-shaped bearer that failed
+  // verification leaves userProvidedApiKey=false and is rejected here instead of silently being
+  // served on the deployment's EXA_API_KEY. Bypass clients are exempt as before.
+  if (!bypassRateLimit && requireOAuth && !config.userProvidedApiKey) {
+    return create401Response();
+  }
+
   if (config.debug) {
-    console.log(`[EXA-MCP] Request URL: ${request.url}`);
+    const loggedUrl = new URL(request.url);
+    loggedUrl.searchParams.delete('exaApiKey');
+    console.log(`[EXA-MCP] Request URL: ${loggedUrl.toString()}`);
     console.log(`[EXA-MCP] Enabled tools: ${config.enabledTools?.join(', ') || 'default'}`);
     console.log(`[EXA-MCP] Auth method: ${config.authMethod}`);
     console.log(`[EXA-MCP] API key provided: ${config.userProvidedApiKey ? 'yes' : 'no (using env var)'}`);

@@ -20,8 +20,7 @@ build/
 .idea/
 
 # Local environment
-.env.local
-.env*.local
+.env*
 
 # Logs
 *.log

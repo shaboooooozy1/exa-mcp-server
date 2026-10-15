@@ -1,5 +1,5 @@
-# Use the official Node.js 18 image as a parent image
-FROM node:18-alpine AS builder
+# Use the official Node.js 22 (LTS) image as a parent image, pinned by digest
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS builder
 
 # Set the working directory in the container to /app
 WORKDIR /app
@@ -18,7 +18,7 @@ COPY tsconfig.json ./
 RUN npm run build
 
 # Use a minimal node image as the base image for running
-FROM node:18-alpine AS runner
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS runner
 
 WORKDIR /app
 
@@ -29,11 +29,12 @@ COPY package.json package-lock.json ./
 # Install only production dependencies
 RUN npm ci --production --ignore-scripts
 
-# Set environment variable for the Exa API key
-ENV EXA_API_KEY=your-api-key-here
+# The Exa API key must be provided at run time: docker run -e EXA_API_KEY=...
+ENV PORT=3000
+USER node
 
 # Expose the port the app runs on
 EXPOSE 3000
 
 # Run the application
-ENTRYPOINT ["node", "smithery/index.cjs"]
+ENTRYPOINT ["node", "smithery/shttp/index.cjs"]
